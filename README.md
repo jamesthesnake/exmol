@@ -5,6 +5,19 @@
 [![PyPI version](https://badge.fury.io/py/exmol.svg)](https://badge.fury.io/py/exmol)
 [![MIT license](https://img.shields.io/badge/License-MIT-blue.svg)](https://lbesson.mit-license.org/)
 
+- [Install](#install)
+- [Counterfactual Generation](#counterfactual-generation)
+- [Descriptor Attribution](#descriptor-attribution)
+- [Usage](#usage)
+- [Further Examples](#further-examples)
+- [Chemical Space](#chemical-space)
+- [SVG](#svg)
+- [Disable Progress Bars](#disable-progress-bars)
+- [API and Docs](#api-and-docs)
+- [Developing](#developing)
+- [Citation](#citation)
+
+
 `exmol` is a package to explain black-box predictions of molecules. The package uses model agnostic explanations to help users understand why a molecule is predicted to have a property.
 
 ## Install
@@ -86,13 +99,21 @@ print(cfs[1])
 }
 ```
 
-We can use the same chemical space to get descriptor attributions for the molecule. Along with `samples`, we also need to supply the `descriptor_type` to get attributions. You can select from `Classic` Rdkit descriptors, `MACCS` fingerprint descriptors, `ECFP` substructure descriptors. If you'd like to use regression coefficients for analysis, specify `return_beta=True`. The descriptor t-statistics are stored in `descriptors.tstats` attribute for the base molecule and can be accessed using `space_tstats = space[0].descriptors.tstats`.
+We can use the same chemical space to get descriptor attributions for the molecule. Along with `samples`, we also need to specify the `descriptor_type` to get attributions. You can select from `Classic` Rdkit descriptors, `MACCS` fingerprint descriptors, `ECFP` substructure descriptors. The default `descriptor_type` is `MACCS`. If you'd like to use regression coefficients for analysis, specify `return_beta=True`. The descriptor t-statistics are stored in `descriptors.tstats` attribute for the base molecule and can be accessed using `space_tstats = space[0].descriptors.tstats`. `plot_descriptors` saves a plot as shown below in the `output_file`.
 
 ```py
 beta = exmol.lime_explain(samples, descriptor_type='ECFP', return_beta=True)
-exmol.plot_descriptors(samples, descriptor_type='ECFP')
+exmol.plot_descriptors(samples, output_file='ecfp.svg')
 ```
 <img alt="ecfp descriptors" src="https://raw.githubusercontent.com/ur-whitelab/exmol/main/paper2_LIME/ECFP.svg" width="400">
+
+You can use a more typical atom attribution plot as well, although note that some information is lost in this representation.
+
+```py
+exmol.plot_utils.similarity_map_using_tstats(samples[0])
+```
+<img alt="molecule attribution by coloring each atom" src="https://raw.githubusercontent.com/ur-whitelab/exmol/main/paper2_LIME/mol-attr.png">
+
 
 You can also plot the chemical space colored by fit to see how well the regression fits the original model. To plot by fit, regression coefficients `beta` need to be passed in as an argument.
 
@@ -107,9 +128,15 @@ exmol.plot_utils.plot_space_by_fit(
 ```
 <img alt="chemical space by fit" src="https://raw.githubusercontent.com/ur-whitelab/exmol/main/paper2_LIME/space_by_fit.png" width="500">
 
+It is also possible to get global attributions for multiple base molecules. For this, the user should create a space around each instance of interest and concatenate these spaces. Then use this joint space to do lime explanations:
+
+```py
+beta = exmol.lime_explain(joint_space, descriptor_type='ECFP', return_beta=True, multiple_bases=True)
+```
+
 ## Further Examples
 
-You can find more examples by looking at the exact code used to generate all figures from our paper [in the docs webpage](https://https://ur-whitelab.github.io/exmol/toc.html).
+You can find more examples by looking at the exact code used to generate all figures from our paper [in the docs webpage](https://ur-whitelab.github.io/exmol/toc.html).
 
 ## Chemical Space
 
