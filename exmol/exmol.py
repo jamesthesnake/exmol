@@ -1,4 +1,5 @@
-from tkinter.messagebox import RETRY
+from functools import reduce
+import inspect
 from typing import *
 import io
 import math
@@ -12,6 +13,7 @@ import selfies as sf  # type: ignore
 import tqdm  # type: ignore
 import textwrap  # type: ignore
 import skunk  # type: ignore
+import synspace  # type: ignore
 
 from ratelimit import limits, sleep_and_retry  # type: ignore
 from sklearn.cluster import DBSCAN  # type: ignore
@@ -23,12 +25,12 @@ from rdkit.Chem import MolToSmiles as mol2smi  # type: ignore
 from rdkit.Chem import rdchem, MACCSkeys, AllChem  # type: ignore
 from rdkit.Chem.Draw import MolToImage as mol2img, DrawMorganBit  # type: ignore
 from rdkit.Chem import rdchem  # type: ignore
-from rdkit.Chem import rdFMCS as MCS  # type: ignore
 from rdkit.DataStructs.cDataStructs import BulkTanimotoSimilarity, TanimotoSimilarity  # type: ignore
-
+import langchain.llms as llms
+import langchain.prompts as prompts
 
 from . import stoned
-from .plot_utils import _mol_images, _image_scatter
+from .plot_utils import _mol_images, _image_scatter, _bit2atoms
 from .data import *
 
 
@@ -43,6 +45,37 @@ def _fp_dist_matrix(smiles, fp_type, _pbar):
 
 def _check_multiple_bases(examples):
     return sum([e.is_origin for e in examples]) > 1
+
+
+def _ecfp_names(examples, joint_bits):
+    # add names for given descriptor indices
+    multiple_bases = _check_multiple_bases(examples)
+    # need to get base molecule(s) for naming
+    bitInfo = {}  # Type Dict[Any, Any]
+    base_mol = [smi2mol(e.smiles) for e in examples if e.is_origin == True]
+    if multiple_bases:
+        multiBitInfo = {}  # type: Dict[int, Tuple[Any, int, int]]
+        for b in base_mol:
+            bitInfo = {}
+            AllChem.GetMorganFingerprint(b, 3, bitInfo=bitInfo)
+            for bit in bitInfo:
+                if bit not in multiBitInfo:
+                    multiBitInfo[bit] = (b, bit, {bit: bitInfo[bit]})
+    else:
+        base_mol = smi2mol(examples[0].smiles)
+        bitInfo = {}  # type: Dict[Any, Any]
+        AllChem.GetMorganFingerprint(base_mol, 3, bitInfo=bitInfo)
+    result = []  # type: List[str]
+    for i in range(len(joint_bits)):
+        k = joint_bits[i]
+        if multiple_bases:
+            m = multiBitInfo[k][0]
+            b = multiBitInfo[k][2]
+            name = name_morgan_bit(m, b, k)
+        else:
+            name = name_morgan_bit(base_mol, bitInfo, k)
+        result.append(name)
+    return tuple(result)
 
 
 def _calculate_rdkit_descriptors(mol):
@@ -128,15 +161,114 @@ def _get_joint_ecfp_descriptors(examples):
         # Get bitinfo and create a union
         b = {}  # type: Dict[Any, Any]
         temp_fp = AllChem.GetMorganFingerprint(m, 3, bitInfo=b)
-        ecfp_joint |= set(b.keys())
-    return ecfp_joint
+        # add if radius greater than 0
+        ecfp_joint |= set([(k, v[0][1]) for k, v in b.items() if v[0][1] > 0])
+    # want to go in order of radius so when
+    # we drop non-unique names, we keep smaller fragments
+    ecfp_joint = list(ecfp_joint)
+    ecfp_joint.sort(key=lambda x: x[1])
+    ecfp_joint = [x[0] for x in ecfp_joint]
+    names = _ecfp_names(examples, ecfp_joint)
+    # downselect to only unique names
+    unique_names = set(names)
+    output_ecfp = []
+    output_names = []
+    for b, n in zip(ecfp_joint, names):
+        if n in unique_names and n is not None:
+            unique_names.remove(n)
+            output_ecfp.append(b)
+            output_names.append(n)
+    return output_ecfp, output_names
+
+
+_SMARTS = None
+
+
+def _load_smarts(path, rank_cutoff=500):
+    # we have a rank cut for SMARTS that match too often
+    smarts = {}
+    with open(path) as f:
+        for line in f.readlines():
+            if line[0] == "#":
+                continue
+            i1 = line.find(":")
+            i2 = line.find(":", i1 + 1)
+            m = MolFromSmarts(line[i2 + 1 :].strip())
+            rank = int(line[i1 + 1 : i2])
+            if rank > rank_cutoff:
+                continue
+            name = line[:i1]
+            if m is None:
+                print(f"Could not parse SMARTS: {line}")
+                print(line[i2:].strip())
+            smarts[name] = (m, rank)
+    return smarts
+
+
+def name_morgan_bit(m: Any, bitInfo: Dict[Any, Any], key: int) -> str:
+    """Get the name of a Morgan bit using a SMARTS dictionary
+
+    :param m: RDKit molecule
+    :param bitInfo: bitInfo dictionary from rdkit.Chem.AllChem.GetMorganFingerprint
+    :param key: bit key corresponding to the fingerprint you want to have named
+    """
+    global _SMARTS
+    if _SMARTS is None:
+        from importlib_resources import files  # type: ignore
+        import exmol.lime_data  # type: ignore
+
+        sp = files(exmol.lime_data).joinpath("smarts.txt")
+        _SMARTS = _load_smarts(sp)
+    morgan_atoms = _bit2atoms(m, bitInfo, key)
+    heteroatoms = set()
+    for a in morgan_atoms:
+        if m.GetAtomWithIdx(a).GetAtomicNum() > 6:
+            heteroatoms.add(a)
+    names = []
+    for name, (sm, r) in _SMARTS.items():
+        matches = m.GetSubstructMatches(sm)
+        for match in matches:
+            # check if match is in morgan bit
+            match = set(match)
+            if match.issubset(morgan_atoms):
+                names.append((r, name, match))
+    names.sort(key=lambda x: x[0])
+    if len(names) == 0:
+        return None
+    umatch = names[0][2]
+    name = names[0][1][0].lower() + names[0][1][1:].replace("_", " ")
+    unique_names = set([names[0][1]])
+    for _, n, m in names:
+        if len(m.intersection(umatch)) == 0:
+            if n not in unique_names:
+                name += "/" + n[0].lower() + n[1:].replace("_", " ")
+                umatch |= m
+                unique_names.add(n)
+    if "/" in name and "fragment" not in name.split("/")[-1]:
+        name = name + " group"
+    # if we failed to match all heteroatoms, fail
+    if len(heteroatoms.difference(umatch)) > 0:
+        return None
+    return name
+
+
+def clear_descriptors(
+    examples: List[Example],
+) -> List[Example]:
+    """Clears all descriptors from examples
+
+    :param examples: list of examples
+    :param descriptor_type: type of descriptor to clear, if None, all descriptors are cleared
+    """
+    for e in examples:
+        e.descriptors = None  # type: ignore
+    return examples
 
 
 def add_descriptors(
     examples: List[Example],
     descriptor_type: str = "MACCS",
     mols: List[Any] = None,
-    multiple_bases: Optional[bool] = None,
 ) -> List[Example]:
     """Add descriptors to passed examples
 
@@ -144,13 +276,9 @@ def add_descriptors(
     :param descriptor_type: Kind of descriptors to return, choose between 'Classic', 'ECFP', or 'MACCS'. Default is 'MACCS'.
     :param mols: Can be used if you already have rdkit Mols computed.
     :return: List of examples with added descriptors
-    :param multiple_bases: Consider multiple bases for plotting (default: infer from examples)
     """
     from importlib_resources import files
     import exmol.lime_data
-
-    if multiple_bases is None:
-        multiple_bases = _check_multiple_bases(examples)
 
     if mols is None:
         mols = [smi2mol(m.smiles) for m in examples]
@@ -176,6 +304,7 @@ def add_descriptors(
                 descriptor_type=descriptor_type,
                 descriptors=descriptors,
                 descriptor_names=descriptor_names,
+                plotting_names=descriptor_names,
             )
         return examples
     elif descriptor_type.lower() == "maccs":
@@ -191,26 +320,22 @@ def add_descriptors(
                 descriptor_type=descriptor_type,
                 descriptors=descriptors,
                 descriptor_names=descriptor_names,
+                plotting_names=descriptor_names,
             )
         return examples
     elif descriptor_type.lower() == "ecfp":
-        # get reference
-        if multiple_bases:
-            # Get a union of ecfps for all bases
-            descriptor_names = _get_joint_ecfp_descriptors(examples)
-        else:
-            bi = {}  # type: Dict[Any, Any]
-            ref_fp = AllChem.GetMorganFingerprint(mols[0], 3, bitInfo=bi)
-            descriptor_names = tuple(bi.keys())
+        descriptor_bits, plotting_names = _get_joint_ecfp_descriptors(examples)
         for e, m in zip(examples, mols):
-            # Now compare to reference and get other fp vectors
-            b = {}  # type: Dict[Any, Any]
-            temp_fp = AllChem.GetMorganFingerprint(m, 3, bitInfo=b)
-            descriptors = tuple([1 if x in b.keys() else 0 for x in descriptor_names])
+            bitInfo = {}  # type: Dict[Any, Any]
+            AllChem.GetMorganFingerprint(m, 3, bitInfo=bitInfo)
+            descriptors = tuple(
+                [1 if x in bitInfo.keys() else 0 for x in descriptor_bits]
+            )
             e.descriptors = Descriptors(
                 descriptor_type=descriptor_type,
                 descriptors=descriptors,
-                descriptor_names=descriptor_names,
+                descriptor_names=descriptor_bits,
+                plotting_names=plotting_names,
             )
         return examples
     else:
@@ -235,7 +360,7 @@ def get_basic_alphabet() -> Set[str]:
         elif "-1" in ai:
             to_remove.append(ai)
     # remove [P],[#P],[=P]
-    to_remove.extend(["[P]", "[#P]", "[=P]"])
+    to_remove.extend(["[P]", "[#P]", "[=P]", "[B]", "[#B]", "[=B]"])
 
     a -= set(to_remove)
     a.add("[O-1]")
@@ -303,7 +428,9 @@ def run_stoned(
 
     # filter out duplicates
     all_mols = [smi2mol(s) for s in all_smiles_collect]
-    all_canon = [mol2smi(m, canonical=True) if m else None for m in all_mols]
+    all_canon = [
+        stoned.largest_mol(mol2smi(m, canonical=True)) if m else None for m in all_mols
+    ]
     seen = set()
     to_keep = [False for _ in all_canon]
     for i in range(len(all_canon)):
@@ -375,6 +502,17 @@ def run_chemed(
 
     mol0 = smi2mol(origin_smiles)
     mols = [smi2mol(s) for s in smiles]
+    all_can = [
+        stoned.largest_mol(mol2smi(m, canonical=True)) if m else None for m in mols
+    ]
+    seen = set()
+    to_keep = [False for _ in all_can]
+    for i in range(len(all_can)):
+        if all_can[i] and all_can[i] not in seen:
+            to_keep[i] = True
+            seen.add(all_can[i])
+    smiles = [s for i, s in enumerate(smiles) if to_keep[i]]
+    mols = [m for i, m in enumerate(mols) if to_keep[i]]
     fp0 = stoned.get_fingerprint(mol0, fp_type)
     scores = []
     # drop Nones
@@ -449,12 +587,15 @@ def sample_space(
     """Sample chemical space around given SMILES
 
     This will evaluate the given function and run the :func:`run_stoned` function over chemical space around molecule. ``num_samples`` will be
-    set to 3,000 by default if using STONED and 150 if using ``chemed``.
+    set to 3,000 by default if using STONED and 150 if using ``chemed``. If using ``custom`` then ``num_samples`` will be set to the length of
+    of the ``data`` list. If using ``synspace`` then ``num_samples`` will be set to 1,000. See :func:`run_stoned` and :func:`run_chemed` for more details.
+    ``synspace`` comes from the package `synspace <https://github.com/whitead/synspace>`. It generates synthetically feasible
+    molecules from a given SMILES.
 
     :param origin_smiles: starting SMILES
     :param f: A function which takes in SMILES or SELFIES and returns predicted value. Assumed to work with lists of SMILES/SELFIES unless `batched = False`
     :param batched: If `f` is batched
-    :param preset: Can be wide, medium, or narrow. Determines how far across chemical space is sampled. Try `"chemed"` preset to only sample commerically available compounds.
+    :param preset: Can be `"wide"`, `"medium"`, `"narrow"`, `"chemed"`, `"custom"`, or `"synspace`". Determines how far across chemical space is sampled. Try `"chemed"` preset to only sample pubchem compounds.
     :param data: If not None and preset is `"custom"` will use this data instead of generating new ones.
     :param method_kwargs: More control over STONED, CHEMED and CUSTOM can be set here. See :func:`run_stoned`, :func:`run_chemed` and  :func:`run_custom`
     :param num_samples: Number of desired samples. Can be set in `method_kwargs` (overrides) or here. `None` means default for preset
@@ -468,7 +609,15 @@ def sample_space(
     wrapped_f = f
 
     # if f only takes in 1 arg, wrap it in a function that takes in 2
-    if f.__code__.co_argcount == 1:
+    # count args with no default value. Looks fancy because of possible objects/partials
+    argcount = len(
+        [
+            i
+            for i in inspect.signature(f).parameters.values()
+            if i.default == inspect.Parameter.empty
+        ]
+    )
+    if argcount == 1:
         if use_selfies:
 
             def wrapped_f(sm, sf):
@@ -487,6 +636,11 @@ def sample_space(
 
     if sanitize_smiles:
         origin_smiles = stoned.sanitize_smiles(origin_smiles)[1]
+    elif "." in origin_smiles:
+        raise ValueError(
+            "Given SMILES contains '.', which indicates it is not a single molecule. "
+            "Please sanitize it first or set sanitize_smiles=True"
+        )
     if origin_smiles is None:
         raise ValueError("Given SMILES does not appear to be valid")
     smi_yhat = np.asarray(batched_f([origin_smiles], [sf.encoder(origin_smiles)]))
@@ -517,6 +671,8 @@ def sample_space(
             method_kwargs["num_samples"] = 150 if num_samples is None else num_samples
         elif preset == "custom" and data is not None:
             method_kwargs["num_samples"] = len(data)
+        elif preset == "synspace":
+            method_kwargs["num_samples"] = 1000 if num_samples is None else num_samples
         else:
             raise ValueError(f'Unknown preset "{preset}"')
     try:
@@ -533,6 +689,17 @@ def sample_space(
         smiles, scores = run_chemed(origin_smiles, _pbar=pbar, **method_kwargs)
         selfies = [sf.encoder(s) for s in smiles]
     elif preset == "custom":
+        smiles, scores = run_custom(
+            origin_smiles, data=cast(Any, data), _pbar=pbar, **method_kwargs
+        )
+        selfies = [sf.encoder(s) for s in smiles]
+    elif preset == "synspace":
+        mols, _ = synspace.chemical_space(origin_smiles, _pbar=pbar, **method_kwargs)
+        if len(mols) < 5:
+            raise ValueError(
+                "Synspace did not return enough molecules. Try adjusting method_kwargs for synspace"
+            )
+        data = [mol2smi(mol).replace("~", "") for mol in mols]
         smiles, scores = run_custom(
             origin_smiles, data=cast(Any, data), _pbar=pbar, **method_kwargs
         )
@@ -600,12 +767,20 @@ def sample_space(
     return exps
 
 
-def _select_examples(cond, examples, nmols):
+def _select_examples(cond, examples, nmols, do_filter=False):
     result = []
+    if do_filter or do_filter is None:
+        from synspace.reos import REOS
+
+        reos = REOS()
+        # if do_filter is None, check if 0th smiles passes filter
+        if do_filter is None:
+            do_filter = reos.process_mol(smi2mol(examples[0].smiles)) == ("ok", "ok")
 
     # similarity filtered by if cluster/counter
     def cluster_score(e, i):
-        return (e.cluster == i) * cond(e) * e.similarity
+        score = (e.cluster == i) * cond(e) * e.similarity
+        return score
 
     clusters = set([e.cluster for e in examples])
     for i in clusters:
@@ -614,24 +789,25 @@ def _select_examples(cond, examples, nmols):
         if cluster_score(close_counter, i):
             result.append(close_counter)
 
-    # trim, in case we had too many cluster
-    result = sorted(result, key=lambda v: v.similarity * cond(v), reverse=True)[:nmols]
-
-    # fill in remaining
-    ncount = sum([cond(e) for e in result])
-    fill = max(0, nmols - ncount)
-    result.extend(
-        sorted(examples, key=lambda v: v.similarity * cond(v), reverse=True)[:fill]
-    )
-
-    return list(filter(cond, result))
+    # sort by similarity
+    result = sorted(result, key=lambda v: v.similarity * cond(v), reverse=True)
+    # back fill
+    result.extend(sorted(examples, key=lambda v: v.similarity * cond(v), reverse=True))
+    final_result = []
+    if do_filter:
+        while len(final_result) < nmols:
+            e = result.pop(0)
+            if reos.process_mol(smi2mol(e.smiles)) == ("ok", "ok"):
+                final_result.append(e)
+    else:
+        final_result = result[:nmols]
+    return list(filter(cond, final_result))
 
 
 def lime_explain(
     examples: List[Example],
     descriptor_type: str = "MACCS",
     return_beta: bool = True,
-    multiple_bases: Optional[bool] = None,
 ):
     """From given :obj:`Examples<Example>`, find descriptor t-statistics (see
     :doc: `index`)
@@ -639,13 +815,9 @@ def lime_explain(
     :param examples: Output from :func: `sample_space`
     :param descriptor_type: Desired descriptors, choose from 'Classic', 'ECFP' 'MACCS'
     :return_beta: Whether or not the function should return regression coefficient values
-    :param multiple_bases: Consider multiple bases for explanation (default: infer from examples)
     """
-    if multiple_bases is None:
-        multiple_bases = _check_multiple_bases(examples)
-
     # add descriptors
-    examples = add_descriptors(examples, descriptor_type, multiple_bases=multiple_bases)
+    examples = add_descriptors(examples, descriptor_type)
     # weighted tanimoto similarities
     w = np.array([1 / (1 + (1 / (e.similarity + 0.000001) - 1) ** 5) for e in examples])
     # Only keep nonzero weights
@@ -681,8 +853,11 @@ def lime_explain(
     se2_beta = se2_epsilon * xtinv
     # now compute t-statistic for existence of coefficients
     tstat = beta * np.sqrt(1 / np.diag(se2_beta))
-    # Set tstats for base, to be used later
-    examples[0].descriptors.tstats = tstat
+    # Set tstats for bases, to be used later
+    # TODO: Used to put them on examples[0] only,
+    # but now copy them to all examples
+    for e in examples:
+        e.descriptors.tstats = tstat
     # Return beta (feature weights) which are the fits if asked for
     if return_beta:
         return beta
@@ -690,17 +865,20 @@ def lime_explain(
         return None
 
 
-def cf_explain(examples: List[Example], nmols: int = 3) -> List[Example]:
+def cf_explain(
+    examples: List[Example], nmols: int = 3, filter_nondrug: Optional[bool] = None
+) -> List[Example]:
     """From given :obj:`Examples<Example>`, find closest counterfactuals (see :doc:`index`)
 
     :param examples: Output from :func:`sample_space`
     :param nmols: Desired number of molecules
+    :param filter_nondrug: Whether or not to filter out non-drug molecules. Default is True if input passes filter
     """
 
     def is_counter(e):
         return e.yhat != examples[0].yhat
 
-    result = _select_examples(is_counter, examples[1:], nmols)
+    result = _select_examples(is_counter, examples[1:], nmols, filter_nondrug)
     for i, r in enumerate(result):
         r.label = f"Counterfactual {i+1}"
 
@@ -711,6 +889,7 @@ def rcf_explain(
     examples: List[Example],
     delta: Union[Any, Tuple[float, float]] = (-1, 1),
     nmols: int = 4,
+    filter_nondrug: Optional[bool] = None,
 ) -> List[Example]:
     """From given :obj:`Examples<Example>`, find closest counterfactuals (see :doc:`index`)
     This version works with regression, so that a counterfactual is if the given example is higher or
@@ -719,6 +898,7 @@ def rcf_explain(
     :param examples: Output from :func:`sample_space`
     :param delta: float or tuple of hi/lo indicating margin for what is counterfactual
     :param nmols: Desired number of molecules
+    :param filter_nondrug: Whether or not to filter out non-drug molecules. Default is True if input passes filter
     """
     if type(delta) is float:
         delta = (-delta, delta)
@@ -730,12 +910,16 @@ def rcf_explain(
         return e.yhat + delta[1] <= examples[0].yhat
 
     hresult = (
-        [] if delta[0] is None else _select_examples(is_high, examples[1:], nmols // 2)
+        []
+        if delta[0] is None
+        else _select_examples(is_high, examples[1:], nmols // 2, filter_nondrug)
     )
     for i, h in enumerate(hresult):
         h.label = f"Increase ({i+1})"
     lresult = (
-        [] if delta[1] is None else _select_examples(is_low, examples[1:], nmols // 2)
+        []
+        if delta[1] is None
+        else _select_examples(is_low, examples[1:], nmols // 2, filter_nondrug)
     )
     for i, l in enumerate(lresult):
         l.label = f"Decrease ({i+1})"
@@ -870,6 +1054,8 @@ def plot_cf(
         fig, axs = plt.subplots(R, C, **figure_kwargs)
     else:
         axs = fig.subplots(R, C)
+    if type(axs) != np.ndarray:  # Happens if nrows=ncols=1
+        axs = np.array([[axs]])
     axs = axs.flatten()
     for i, (img, e) in enumerate(zip(imgs, exps)):
         title = "Base" if e.is_origin else f"Similarity = {e.similarity:.2f}\n{e.label}"
@@ -889,7 +1075,6 @@ def plot_descriptors(
     fig: Any = None,
     figure_kwargs: Dict = None,
     title: str = None,
-    multiple_bases: Optional[bool] = None,
     return_svg: bool = False,
 ):
     """Plot descriptor attributions from given set of Examples.
@@ -899,7 +1084,6 @@ def plot_descriptors(
     :param fig: Figure to plot on to
     :param figure_kwargs: kwargs to pass to :func:`plt.figure<matplotlib.pyplot.figure>`
     :param title: Title for the plot
-    :param multiple_bases: Consider multiple bases for explanation (default: infer from examples)
     :param return_svg: Whether to return svg for plot
     """
 
@@ -910,8 +1094,7 @@ def plot_descriptors(
     # infer descriptor_type from examples
     descriptor_type = examples[0].descriptors.descriptor_type.lower()
 
-    if multiple_bases is None:
-        multiple_bases = _check_multiple_bases(examples)
+    multiple_bases = _check_multiple_bases(examples)
 
     if output_file is None and descriptor_type == "ecfp" and not return_svg:
         raise ValueError("No filename provided to save the plot")
@@ -928,11 +1111,13 @@ def plot_descriptors(
 
     # find important descriptors
     d_importance = {
-        a: [b, i]
-        for i, a, b in zip(
-            np.arange(len(examples[0].descriptors.descriptors)),
-            examples[0].descriptors.descriptor_names,
-            space_tstats,
+        a: [b, i, n]
+        for i, (a, b, n) in enumerate(
+            zip(
+                examples[0].descriptors.descriptor_names,
+                space_tstats,
+                examples[0].descriptors.plotting_names,
+            )
         )
         if not np.isnan(b)
     }
@@ -942,6 +1127,7 @@ def plot_descriptors(
     t = [a[0] for a in list(d_importance.values())][:5]
     key_ids = [a[1] for a in list(d_importance.values())][:5]
     keys = [a for a in list(d_importance.keys())]
+    names = [a[2] for a in list(d_importance.values())][:5]
 
     # set colors
     colors = []
@@ -992,11 +1178,13 @@ def plot_descriptors(
             bi = {}
             m = smi2mol(examples[0].smiles)
             fp = AllChem.GetMorganFingerprint(m, 3, bitInfo=bi)
-
-    for rect, ti, k, ki in zip(bar1, t, keys, key_ids):
+    for rect, ti, k, ki, n in zip(bar1, t, keys, key_ids, names):
+        # account for Nones
+        if n is None:
+            n = ""
         # annotate patches with text desciption
         y = rect.get_y() + rect.get_height() / 2.0
-        k = textwrap.fill(str(k), 20)
+        n = textwrap.fill(str(n), 20)
         if ti < 0:
             x = 0.25
             skx = (
@@ -1008,7 +1196,7 @@ def plot_descriptors(
             ax.text(
                 x,
                 y,
-                " " if descriptor_type == "ecfp" else k,
+                n,
                 ha="left",
                 va="center",
                 wrap=True,
@@ -1025,7 +1213,7 @@ def plot_descriptors(
             ax.text(
                 x,
                 y,
-                " " if descriptor_type == "ecfp" else k,
+                n,
                 ha="right",
                 va="center",
                 wrap=True,
@@ -1104,6 +1292,7 @@ def plot_descriptors(
             with open(output_file, "w") as f:  # type: ignore
                 f.write(svg)
         if return_svg:
+            plt.close()
             return svg
     elif descriptor_type == "classic":
         xlim = max(np.max(np.absolute(t)), T + 1)
@@ -1111,3 +1300,190 @@ def plot_descriptors(
         if output_file is not None:
             plt.tight_layout()
             plt.savefig(output_file, dpi=180, bbox_inches="tight")
+
+
+def check_multiple_aromatic_rings(mol):
+    ri = mol.GetRingInfo()
+    count = 0
+    for bondRing in ri.BondRings():
+        flag = True
+        for id in bondRing:
+            if not mol.GetBondWithIdx(id).GetIsAromatic():
+                flag = False
+                continue
+        if flag:
+            count += 1
+    return True if count > 1 else False
+
+
+def merge_text_explains(
+    *args: List[Tuple[str, float]], filter: Optional[float] = None
+) -> List[Tuple[str, float]]:
+    """Merge multiple text explanations into one and sort."""
+    # sort them by T value, putting negative examples at the end
+    joint = reduce(lambda x, y: x + y, args)
+    if len(joint) == 0:
+        return []
+    # get the highest (hopefully) positive
+    m = max([x[1] for x in joint if x[1] > 0])
+    pos = [x for x in joint if x[1] == m]
+    joint = [x for x in joint if x[1] != m]
+    joint = sorted(joint, key=lambda x: np.absolute(x[1]), reverse=True)
+    return pos + joint
+
+
+_multi_prompt = (
+    "The following is information about molecules that connect their structures "
+    'to the property called "{property}." '
+    "The information is attributes of molecules expressed as questions with answers and "
+    "relative importance. "
+    "Using all aspects of this information, propose an explanation (50-150 words) "
+    'for the molecular property "{property}." '
+    "Only use the information below. Answer in a scientific "
+    'tone and make use of counterfactuals (e.g., "If X were present, {property} would be negatively...").'
+    "\n\n"
+    "{text}\n\n"
+    "Explanation:"
+)
+
+_single_prompt = (
+    "The following is information about a specific molecule that connects its structure "
+    'to the property "{property}." '
+    "The information is structural attributes expressed as questions with answers and "
+    "relative importance. "
+    "Using all aspects of this information, propose an explanation (50-150 words) "
+    'for this molecule\'s property "{property}." '
+    "Only use the information below. Answer in a scientific "
+    'tone and make use of counterfactuals (e.g., "If X were present, its {property} would be negatively...").'
+    "\n\n"
+    "{text}\n\n"
+    "Explanation:"
+)
+
+
+def text_explain_generate(
+    text_explanations: List[Tuple[str, float]],
+    property_name: str,
+    llm: Optional[llms.BaseLLM] = None,
+    single: bool = True,
+) -> str:
+    """Insert text explanations into template, and generate explanation.
+
+    Args:
+        text_explanations: List of text explanations.
+        property_name: Name of property.
+        llm: Language model to use.
+        single: Whether to use a prompt about a single molecule or multiple molecules.
+    """
+    # want to have negative examples at the end
+    text_explanations.sort(key=lambda x: x[1], reverse=True)
+    text = "\n".join(
+        [
+            # f"{x[0][:-1]} {'Positive' if x[1] > 0 else 'Negative'} correlation."
+            f"{x[0][:-1]}."
+            for x in text_explanations
+        ]
+    )
+    prompt_template = prompts.PromptTemplate(
+        input_variables=["property", "text"],
+        template=_single_prompt if single else _multi_prompt,
+    )
+    prompt = prompt_template.format(property=property_name, text=text)
+    if llm is None:
+        llm = llms.OpenAI(temperature=0.05)
+    return llm(prompt)
+
+
+def text_explain(
+    examples: List[Example],
+    descriptor_type: str = "maccs",
+    count: int = 5,
+    presence_thresh: float = 0.2,
+    include_weak: Optional[bool] = None,
+) -> List[Tuple[str, float]]:
+    """Take an example and convert t-statistics into text explanations
+
+    :param examples: Output from :func:`sample_space`
+    :param descriptor_type: Type of descriptor, either "maccs", or "ecfp".
+    :param count: Number of text explanations to return
+    :param presence_thresh: Threshold for presence of descriptor in examples
+    :param include_weak: Include weak descriptors. If not set, the function
+    will be first have this set to False, and if no descriptors are found,
+    will be set to True and function will be re-run
+    """
+    descriptor_type = descriptor_type.lower()
+    # populate lime explanation
+    if examples[-1].descriptors is None:
+        lime_explain(examples, descriptor_type=descriptor_type)
+    nbases = sum([1 for e in examples if e.is_origin])
+
+    # Take t-statistics, rank them
+    d_importance = [
+        (n, t, i)  # name, t-stat, index
+        for i, (n, t) in enumerate(
+            zip(
+                examples[0].descriptors.plotting_names,
+                examples[0].descriptors.tstats,
+            )
+        )
+        # don't want NANs and want match (if not multiple bases)
+        if not np.isnan(t)
+    ]
+
+    d_importance = sorted(d_importance, key=lambda x: abs(x[1]), reverse=True)
+    # get significance value - if >significance, then important else weakly important?
+    w = np.array([1 / (1 + (1 / (e.similarity + 0.000001) - 1) ** 5) for e in examples])
+    effective_n = np.sum(w) ** 2 / np.sum(w**2)
+    if np.isnan(effective_n):
+        effective_n = len(examples)
+    T = ss.t.ppf(0.975, df=effective_n)
+
+    pos_count = 0
+    neg_count = 0
+    result = []
+    existing_names = set()
+    for k, v, i in d_importance:
+        if pos_count + neg_count == count:
+            break
+        name = k
+        if name is None or name in existing_names:
+            continue
+        existing_names.add(name)
+        if abs(v) > 4:
+            imp = "This is very important for the property\n"
+        elif abs(v) >= T:
+            imp = "This is important for the property\n"
+        elif include_weak:
+            imp = "This could be relevant for the property\n"
+        else:
+            continue
+        # check if it's present in majority of base molecules
+
+        present = sum(
+            [1 for e in examples if e.descriptors.descriptors[i] != 0 and e.is_origin]
+        )
+        if present / nbases < (1 - presence_thresh) and v < 0:
+            if neg_count == count - 2:
+                # don't want to have only negative examples
+                continue
+            kind = "No and it would be negatively correlated with property (counterfactual)."
+            neg_count += 1
+        elif present / nbases > presence_thresh and v > 0:
+            kind = "Yes and this is positively correlated with property."
+            pos_count += 1
+        else:
+            continue
+        # adjust name to be question
+        if name[-1] != "?":
+            name = "Is there " + name + "?"
+        s = f"{name} {kind} {imp}"
+        result.append((s, v))
+    if len(result) == 0 or pos_count == 0 and include_weak is None:
+        return text_explain(
+            examples,
+            descriptor_type=descriptor_type,
+            count=count,
+            presence_thresh=presence_thresh,
+            include_weak=True,
+        )
+    return result
