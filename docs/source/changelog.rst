@@ -1,6 +1,37 @@
 Change Log
 ==========
 
+v3.0.2 (2023-02-23)
+-------------------
+* Now try to find largest component with multiple compounds separated via `.` in SMILES
+* Added langchain for text explanations
+
+
+v3.0.1 (2023-02-02)
+-------------------
+* Removed `~` any bonds from SMILES strings coming from synspace
+
+
+v3.0.0 (2023-01-24)
+-------------------
+* Added `synspace` method to generate synthetically feasible space
+* Added drug-like filter by default for counterfactuals
+
+
+v2.2.1 (2022-12-7)
+-------------------
+* Fixed bug in sorting for text explanations
+* Fixed empty plot names saying `None`
+* Added priority for naming and removed invalid names
+* Added more names (metyhl, ethyl, butyl, etc)
+* Fixed `sample_space` to accept partials or objects
+* Added openai prompting
+* Added `name_morgan_bit` as external facing
+
+v2.2.0 (2022-11-3)
+-------------------
+* Added natural language explanation method
+
 v2.1.1 (2022-6-03)
 ------------
 * Fixed plotting bug in `plot_descriptors`
